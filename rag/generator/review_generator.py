@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import openai
 import structlog
 
+from safety.tone_classifier import TONE_TIMEOUT_SECONDS, ToneClassifier
+
 from .output_parser import FeedbackSection, parse_review_output
 from .prompt_templates import get_template
 
@@ -59,29 +61,63 @@ class ReviewGenerator:
             context=context_text, github_username=github_username, project_count=project_count
         )
 
-        # Call LLM
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=[
-                {"role": "system", "content": "You are an expert portfolio reviewer."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
-        )
+        classifier = ToneClassifier(self.client, self.config.model)
+        # One initial generation plus at most one regeneration.
+        for attempt in range(1, 3):
+            attempt_prompt = prompt
+            if attempt == 2:
+                attempt_prompt += (
+                    "\nRegenerate this section with constructive, specific, respectful feedback. "
+                    "Give actionable guidance where appropriate and preserve the requested format."
+                )
+            try:
+                response = self.client.with_options(
+                    timeout=TONE_TIMEOUT_SECONDS, max_retries=0
+                ).chat.completions.create(
+                    model=self.config.model,
+                    messages=[
+                        {"role": "system", "content": "You are an expert portfolio reviewer."},
+                        {"role": "user", "content": attempt_prompt},
+                    ],
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens,
+                )
+                content = response.choices[0].message.content
+            except (openai.OpenAIError, TimeoutError, IndexError, AttributeError):
+                logger.warning(
+                    "section_tone_check",
+                    section=section_name,
+                    outcome="generation_error",
+                    attempt=attempt,
+                )
+                continue
 
-        content = response.choices[0].message.content
+            verdict = classifier.classify(content, section_name)
+            outcome = (
+                "pass"
+                if verdict.constructive is True
+                else "fail" if verdict.constructive is False else "unknown"
+            )
+            logger.info(
+                "section_tone_check", section=section_name, outcome=outcome, attempt=attempt
+            )
+            if verdict.constructive is not True or not isinstance(content, str):
+                continue
 
-        # Parse output
-        sections = parse_review_output(content)
+            # Preserve the existing parser contract for accepted responses.
+            sections = parse_review_output(content)
+            if sections:
+                return sections[0]
+            logger.warning("no_sections_parsed", section_name=section_name)
+            return FeedbackSection(
+                section_name=section_name, content=content, confidence=0.6, suggestions=[]
+            )
 
-        # Return first section or create default
-        if sections:
-            return sections[0]
-
-        logger.warning("no_sections_parsed", section_name=section_name)
         return FeedbackSection(
-            section_name=section_name, content=content, confidence=0.6, suggestions=[]
+            section_name=section_name,
+            content="Feedback is temporarily unavailable for this section.",
+            confidence=0.0,
+            suggestions=[],
         )
 
     def generate_full_review(
